@@ -5,6 +5,8 @@
 
 set -eu
 umask 077
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+export PATH
 
 LISTEN_ADDRESS="::"
 METHOD="2022-blake3-aes-256-gcm"
@@ -36,6 +38,11 @@ CONFIG_DIR_CREATED=0
 TMP_KEY=""
 TMP_CONFIG=""
 TMP_SERVICE=""
+VALIDATE_FILE=""
+URI_TMP=""
+LOCK_DIR="/run/shadowsocks-rust-install.lock"
+LOCK_HELD=0
+SERVICE_ADD_ATTEMPTED=0
 
 info() {
     printf '[INFO] %s\n' "$*"
@@ -58,6 +65,16 @@ remove_temp_files() {
     [ -n "$TMP_KEY" ] && rm -f "$TMP_KEY" 2>/dev/null || true
     [ -n "$TMP_CONFIG" ] && rm -f "$TMP_CONFIG" 2>/dev/null || true
     [ -n "$TMP_SERVICE" ] && rm -f "$TMP_SERVICE" 2>/dev/null || true
+    [ -n "$VALIDATE_FILE" ] && rm -f "$VALIDATE_FILE" 2>/dev/null || true
+    [ -n "$URI_TMP" ] && rm -f "$URI_TMP" 2>/dev/null || true
+}
+
+release_lock() {
+    if [ "$LOCK_HELD" -eq 1 ]; then
+        rm -f "${LOCK_DIR}/pid" 2>/dev/null || true
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+        LOCK_HELD=0
+    fi
 }
 
 restore_regular_file() {
@@ -81,21 +98,42 @@ remove_created_file() {
 }
 
 service_is_enabled() {
-    enabled_services=$(rc-update show default 2>/dev/null) || return 1
+    enabled_services=$(rc-update show default 2>/dev/null) || return 2
     printf '%s\n' "$enabled_services" | awk -v service="$SERVICE_NAME" \
         '$1 == service || $2 == service { found=1 } END { exit !found }'
+}
+
+service_pid_is_alive() {
+    pid_file="/run/${SERVICE_NAME}.pid"
+    [ -r "$pid_file" ] || return 1
+    service_pid=$(cat "$pid_file" 2>/dev/null) || return 1
+    case "$service_pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ -r "/proc/${service_pid}/comm" ] || return 1
+    [ "$(cat "/proc/${service_pid}/comm" 2>/dev/null)" = "ssserver" ] || return 1
+    kill -0 "$service_pid" 2>/dev/null
+}
+
+service_is_active_or_alive() {
+    if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
+        return 0
+    fi
+    service_pid_is_alive
 }
 
 rollback_on_error() {
     status=$?
 
+    trap - 0 INT TERM
+    set +e
     remove_temp_files
 
     if [ "$status" -ne 0 ] && [ "$TRANSACTION_STARTED" -eq 1 ]; then
         warn "部署失败，正在恢复之前的配置。"
 
         if [ "$SERVICE_START_ATTEMPTED" -eq 1 ] && \
-           rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
+           service_is_active_or_alive; then
             if ! rc-service "$SERVICE_NAME" stop >/dev/null 2>&1; then
                 warn "回滚失败，无法停止新服务进程。"
                 ROLLBACK_FAILED=1
@@ -110,10 +148,6 @@ rollback_on_error() {
 
         if [ "$OLD_SERVICE_EXISTS" -eq 1 ] && [ -n "$BACKUP_DIR" ]; then
             restore_regular_file "${BACKUP_DIR}/${SERVICE_NAME}" "$SERVICE_FILE"
-            if ! chmod 0755 "$SERVICE_FILE" 2>/dev/null; then
-                warn "回滚失败，无法设置 OpenRC 服务权限。"
-                ROLLBACK_FAILED=1
-            fi
         else
             remove_created_file "$SERVICE_FILE"
         fi
@@ -131,9 +165,17 @@ rollback_on_error() {
             fi
         fi
 
-        if [ "$SERVICE_WAS_ENABLED" -eq 0 ]; then
-            if ! rc-update del "$SERVICE_NAME" default >/dev/null 2>&1; then
-                warn "回滚失败，无法撤销 OpenRC default runlevel 注册。"
+        if [ "$SERVICE_WAS_ENABLED" -eq 0 ] && \
+           [ "$SERVICE_ADD_ATTEMPTED" -eq 1 ]; then
+            service_is_enabled
+            enabled_state=$?
+            if [ "$enabled_state" -eq 0 ]; then
+                if ! rc-update del "$SERVICE_NAME" default >/dev/null 2>&1; then
+                    warn "回滚失败，无法撤销 OpenRC default runlevel 注册。"
+                    ROLLBACK_FAILED=1
+                fi
+            elif [ "$enabled_state" -ne 1 ]; then
+                warn "回滚失败，无法查询 OpenRC default runlevel 状态。"
                 ROLLBACK_FAILED=1
             fi
         fi
@@ -155,6 +197,7 @@ rollback_on_error() {
         fi
     fi
 
+    release_lock
     trap - 0
     if [ "$status" -eq 0 ]; then
         exit 0
@@ -175,6 +218,34 @@ require_root_and_alpine() {
     [ -x /sbin/openrc-run ] || die "未找到 /sbin/openrc-run。"
 }
 
+acquire_lock() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        LOCK_HELD=1
+        printf '%s\n' "$$" > "${LOCK_DIR}/pid"
+        chmod 0700 "$LOCK_DIR"
+        return 0
+    fi
+
+    if [ -r "${LOCK_DIR}/pid" ]; then
+        lock_pid=$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)
+        case "$lock_pid" in
+            ''|*[!0-9]*) ;;
+            *)
+                if kill -0 "$lock_pid" 2>/dev/null; then
+                    die "已有另一个部署进程运行中（PID $lock_pid）。"
+                fi
+                ;;
+        esac
+    fi
+
+    rm -f "${LOCK_DIR}/pid" 2>/dev/null || die "无法清理失效的部署锁。"
+    rmdir "$LOCK_DIR" 2>/dev/null || die "部署锁已存在，请确认没有其他安装进程。"
+    mkdir "$LOCK_DIR" || die "无法创建部署锁。"
+    LOCK_HELD=1
+    printf '%s\n' "$$" > "${LOCK_DIR}/pid"
+    chmod 0700 "$LOCK_DIR"
+}
+
 install_dependencies() {
     info "安装 Shadowsocks、OpenRC 检查和地址检测所需的软件包。"
     if ! apk add --no-cache \
@@ -185,8 +256,10 @@ install_dependencies() {
         die "软件包安装失败。请确认 Alpine 的 community 仓库已启用。"
     fi
 
-    SSSERVER_PATH=$(command -v ssserver) || die "未找到 ssserver。"
-    SSSERVICE_PATH=$(command -v ssservice) || die "未找到 ssservice。"
+    SSSERVER_PATH="/usr/bin/ssserver"
+    SSSERVICE_PATH="/usr/bin/ssservice"
+    [ -x "$SSSERVER_PATH" ] || die "未找到 /usr/bin/ssserver。"
+    [ -x "$SSSERVICE_PATH" ] || die "未找到 /usr/bin/ssservice。"
     has_command ss || die "未找到 ss 命令。"
     has_command awk || die "未找到 awk。"
     has_command base64 || die "未找到 base64。"
@@ -239,17 +312,25 @@ validate_psk() {
     VALIDATE_FILE=$(mktemp /tmp/shadowsocks-rust-key.XXXXXX) || return 1
     if ! printf '%s' "$VALIDATE_KEY" | base64 -d > "$VALIDATE_FILE" 2>/dev/null; then
         rm -f "$VALIDATE_FILE"
+        VALIDATE_FILE=""
         return 1
     fi
 
     VALIDATE_BYTES=$(wc -c < "$VALIDATE_FILE" | tr -d '[:space:]')
     if [ "$VALIDATE_BYTES" != "32" ]; then
         rm -f "$VALIDATE_FILE"
+        VALIDATE_FILE=""
         return 1
     fi
 
-    VALIDATE_CANONICAL=$(base64 "$VALIDATE_FILE" | tr -d '\r\n')
+    VALIDATE_BASE64_OUTPUT=$(base64 "$VALIDATE_FILE") || {
+        rm -f "$VALIDATE_FILE"
+        VALIDATE_FILE=""
+        return 1
+    }
+    VALIDATE_CANONICAL=$(printf '%s' "$VALIDATE_BASE64_OUTPUT" | tr -d '\r\n')
     rm -f "$VALIDATE_FILE"
+    VALIDATE_FILE=""
     [ "$VALIDATE_CANONICAL" = "$VALIDATE_KEY" ] || return 1
 }
 
@@ -287,6 +368,14 @@ prompt_server_address() {
             SERVER_ADDRESS=${SERVER_ADDRESS%\]}
             ;;
     esac
+
+    if [ -n "$SERVER_ADDRESS" ]; then
+        case "$SERVER_ADDRESS" in
+            *[!A-Za-z0-9.:-]*)
+                die "服务器地址只能包含字母、数字、点、连字符或冒号。"
+                ;;
+        esac
+    fi
 }
 
 ensure_safe_target() {
@@ -303,6 +392,8 @@ backup_existing_files() {
     ensure_safe_target "$CONFIG_FILE"
     ensure_safe_target "$SERVICE_FILE"
     ensure_safe_target "$KEY_FILE"
+    ensure_safe_target "$LOG_FILE"
+    ensure_safe_target "$ERROR_LOG_FILE"
 
     [ -f "$CONFIG_FILE" ] && OLD_CONFIG_EXISTS=1
     [ -f "$SERVICE_FILE" ] && OLD_SERVICE_EXISTS=1
@@ -322,7 +413,7 @@ backup_existing_files() {
 stop_existing_service() {
     TRANSACTION_STARTED=1
 
-    if [ -x "$SERVICE_FILE" ] && rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
+    if [ -x "$SERVICE_FILE" ] && service_is_active_or_alive; then
         SERVICE_WAS_ACTIVE=1
         if ! rc-service "$SERVICE_NAME" stop >/dev/null 2>&1; then
             die "无法停止旧服务，已中止部署。"
@@ -330,11 +421,13 @@ stop_existing_service() {
         SERVICE_STOPPED=1
 
         attempts=0
-        while rc-service "$SERVICE_NAME" status >/dev/null 2>&1; do
+        while service_is_active_or_alive; do
             attempts=$((attempts + 1))
             [ "$attempts" -lt 10 ] || die "旧服务停止超时，已中止部署。"
             sleep 1
         done
+    elif [ ! -x "$SERVICE_FILE" ] && service_pid_is_alive; then
+        die "检测到没有对应 OpenRC 服务文件的 ssserver 进程，已中止部署。"
     fi
 }
 
@@ -496,7 +589,12 @@ build_ss_uri() {
     SS_URI=""
     [ -n "$SERVER_ADDRESS" ] || return 0
 
-    URI_USERINFO=$(printf '%s:%s' "$METHOD" "$PSK" | base64 | tr -d '\r\n' | tr '+/' '-_' | tr -d '=')
+    URI_TMP=$(mktemp /tmp/shadowsocks-rust-uri.XXXXXX) || die "无法创建 URI 临时文件。"
+    printf '%s:%s' "$METHOD" "$PSK" > "$URI_TMP" || die "无法准备 URI 数据。"
+    URI_BASE64=$(base64 "$URI_TMP") || die "URI Base64 编码失败。"
+    rm -f "$URI_TMP"
+    URI_TMP=""
+    URI_USERINFO=$(printf '%s' "$URI_BASE64" | tr -d '\r\n' | tr '+/' '-_' | tr -d '=')
     URI_HOST=$SERVER_ADDRESS
     case "$URI_HOST" in
         *:*)
@@ -542,13 +640,21 @@ print_summary() {
 
 main() {
     require_root_and_alpine
+    acquire_lock
     install_dependencies
     prompt_port
     prompt_psk
     prompt_server_address
     backup_existing_files
     if service_is_enabled; then
+        enabled_state=0
+    else
+        enabled_state=$?
+    fi
+    if [ "$enabled_state" -eq 0 ]; then
         SERVICE_WAS_ENABLED=1
+    elif [ "$enabled_state" -ne 1 ]; then
+        die "无法查询 OpenRC default runlevel 状态。"
     fi
     stop_existing_service
     check_port_is_free
@@ -559,6 +665,7 @@ main() {
     start_service
     verify_listener
 
+    SERVICE_ADD_ATTEMPTED=1
     if ! rc-update add "$SERVICE_NAME" default; then
         die "设置 OpenRC 开机启动失败。"
     fi

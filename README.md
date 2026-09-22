@@ -58,7 +58,8 @@ URI 中必须带方括号，例如 `[2001:db8::1]`。
 
 客户端必须支持 Shadowsocks 2022 和
 `2022-blake3-aes-256-gcm`。同时在 VPS 安全组或云防火墙放行脚本选择的 TCP/UDP
-端口。
+端口。脚本不会自动修改 iptables、nftables 或云安全组规则；如果 Alpine 主机本身有
+防火墙，也必须单独放行相同的 TCP/UDP 端口。
 
 ## 服务管理
 
@@ -73,4 +74,5 @@ cat /root/ss2022-key.txt
 重复运行脚本前，已有配置、服务文件和密钥会备份到 `/root/shadowsocks-rust-backup.*`。
 
 选择 `1-1023` 端口时，OpenRC 服务仅额外使用 `CAP_NET_BIND_SERVICE`；普通高端口不添加
-额外能力。
+额外能力。服务使用系统 `nobody:nobody` 账户，配置文件由 `root:nobody` 持有并以
+`0640` 权限读取。
