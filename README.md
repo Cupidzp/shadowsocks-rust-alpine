@@ -5,7 +5,7 @@
 
 默认行为：
 
-- 监听地址固定为 `::`
+- 有全局 IPv6 时监听 `::`；IPv4-only 服务器自动监听 `0.0.0.0`
 - 默认端口为 `12345`，也可以交互输入 `1-65535` 的端口
 - 加密方式固定为 `2022-blake3-aes-256-gcm`
 - 自定义 PSK 必须是解码后正好 32 字节的标准 Base64
@@ -14,7 +14,7 @@
 - OpenRC 服务：`ss-rust`
 - 运行用户：`nobody:nobody`
 - 监听 TCP 和 UDP
-- 配置使用 `server: "::"`，并请求关闭 `IPV6_V6ONLY` 以兼容 IPv4-mapped 连接
+- IPv6 模式使用 `server: "::"` 和 `ipv6_only: false`；IPv4 模式省略 IPv6 专用字段
 
 ## Alpine 上执行
 
@@ -53,8 +53,8 @@ curl
 - PSK
 - Shadowsocks `ss://` URI
 
-如果自动获取公网 IPv6 失败，使用服务器公网 IPv6 地址手动填写节点。IPv6 地址在
-URI 中必须带方括号，例如 `[2001:db8::1]`。
+脚本会优先使用 IPv6；没有全局 IPv6 时自动切换到 IPv4。IPv6 地址在 URI 中必须带
+方括号，例如 `[2001:db8::1]`。
 
 客户端必须支持 Shadowsocks 2022 和
 `2022-blake3-aes-256-gcm`。同时在 VPS 安全组或云防火墙放行脚本选择的 TCP/UDP

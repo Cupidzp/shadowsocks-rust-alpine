@@ -9,6 +9,9 @@ PATH=/sbin:/usr/sbin:/bin:/usr/bin
 export PATH
 
 LISTEN_ADDRESS="::"
+LISTEN_FAMILY="ipv6"
+IPV4_AVAILABLE=0
+IPV6_AVAILABLE=0
 METHOD="2022-blake3-aes-256-gcm"
 DEFAULT_PORT="12345"
 SERVICE_NAME="ss-rust"
@@ -246,6 +249,58 @@ acquire_lock() {
     chmod 0700 "$LOCK_DIR"
 }
 
+ipv6_global_available() {
+    [ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ] || return 1
+    [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "0" ] || return 1
+
+    if has_command ip; then
+        ip -6 addr show scope global 2>/dev/null | \
+            awk '$1 == "inet6" { found=1 } END { exit !found }'
+        return $?
+    fi
+
+    [ -r /proc/net/if_inet6 ] || return 1
+    awk '$4 == "00" { found=1 } END { exit !found }' /proc/net/if_inet6
+}
+
+ipv4_global_available() {
+    if has_command ip; then
+        ip -4 addr show scope global 2>/dev/null | \
+            awk '$1 == "inet" { found=1 } END { exit !found }'
+        return $?
+    fi
+
+    has_command curl || return 1
+    ipv4_probe=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)
+    [ -n "$ipv4_probe" ]
+}
+
+select_listen_address() {
+    if ipv6_global_available; then
+        IPV6_AVAILABLE=1
+    fi
+    if ipv4_global_available; then
+        IPV4_AVAILABLE=1
+    fi
+
+    if [ "$IPV4_AVAILABLE" -eq 1 ] && [ "$IPV6_AVAILABLE" -eq 1 ]; then
+        # Keep one dual-stack IPv6 socket with IPV6_V6ONLY disabled. Clients use IPv4 first.
+        LISTEN_ADDRESS="::"
+        LISTEN_FAMILY="dual"
+        info "检测到双栈网络，使用 IPv4 优先的双栈监听。"
+    elif [ "$IPV4_AVAILABLE" -eq 1 ]; then
+        LISTEN_ADDRESS="0.0.0.0"
+        LISTEN_FAMILY="ipv4"
+        info "未检测到可用的全局 IPv6，自动切换为 IPv4 监听。"
+    elif [ "$IPV6_AVAILABLE" -eq 1 ]; then
+        LISTEN_ADDRESS="::"
+        LISTEN_FAMILY="ipv6"
+        info "未检测到可用的全局 IPv4，使用 IPv6-only 监听。"
+    else
+        die "未检测到可用的全局 IPv4 或 IPv6 地址。"
+    fi
+}
+
 install_dependencies() {
     info "安装 Shadowsocks、OpenRC 检查和地址检测所需的软件包。"
     if apk add --no-cache \
@@ -369,7 +424,12 @@ prompt_server_address() {
     IFS= read -r SERVER_ADDRESS < /dev/tty || die "读取服务器地址失败。"
 
     if [ -z "$SERVER_ADDRESS" ]; then
-        SERVER_ADDRESS=$(curl -6fsS --max-time 5 https://api64.ipify.org 2>/dev/null || true)
+        if [ "$LISTEN_FAMILY" = "dual" ] || [ "$LISTEN_FAMILY" = "ipv4" ]; then
+            SERVER_ADDRESS=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)
+        fi
+        if [ -z "$SERVER_ADDRESS" ]; then
+            SERVER_ADDRESS=$(curl -6fsS --max-time 5 https://api64.ipify.org 2>/dev/null || true)
+        fi
     fi
 
     case "$SERVER_ADDRESS" in
@@ -483,7 +543,8 @@ write_config() {
     chmod 0750 "$CONFIG_DIR"
 
     TMP_CONFIG=$(mktemp "${CONFIG_DIR}/config.json.XXXXXX") || die "无法创建临时配置文件。"
-    cat > "$TMP_CONFIG" <<EOF
+    if [ "$LISTEN_FAMILY" = "ipv6" ] || [ "$LISTEN_FAMILY" = "dual" ]; then
+        cat > "$TMP_CONFIG" <<EOF
 {
   "server": "$LISTEN_ADDRESS",
   "server_port": $PORT,
@@ -495,6 +556,19 @@ write_config() {
   "ipv6_only": false
 }
 EOF
+    else
+        cat > "$TMP_CONFIG" <<EOF
+{
+  "server": "$LISTEN_ADDRESS",
+  "server_port": $PORT,
+  "password": "$PSK",
+  "method": "$METHOD",
+  "mode": "tcp_and_udp",
+  "timeout": 300,
+  "no_delay": true
+}
+EOF
+    fi
     chown root:nobody "$TMP_CONFIG"
     chmod 0640 "$TMP_CONFIG"
     mv -f "$TMP_CONFIG" "$CONFIG_FILE"
@@ -553,14 +627,12 @@ start_service() {
     fi
 }
 
-listener_matches() {
+listener_port_matches() {
     listener_output=$1
-    protocol=$2
+    listener_state=$2
 
-    printf '%s\n' "$listener_output" | awk -v p=":$PORT" -v proto="$protocol" '
-        $1 == proto && $5 ~ (p "$") && $0 ~ /ssserver/ {
-            found=1
-        }
+    printf '%s\n' "$listener_output" | awk -v p=":$PORT" -v state="$listener_state" '
+        $1 == state && $4 ~ (p "$") { found=1 }
         END { exit !found }
     '
 }
@@ -568,11 +640,22 @@ listener_matches() {
 verify_listener() {
     attempts=0
     while [ "$attempts" -lt 15 ]; do
-        if IPV6_OUTPUT=$(ss -6 -tulpn 2>/dev/null); then
-            if listener_matches "$IPV6_OUTPUT" tcp && \
-               listener_matches "$IPV6_OUTPUT" udp; then
-                LISTEN_OUTPUT=$IPV6_OUTPUT
+        if [ "$LISTEN_FAMILY" = "ipv6" ] || [ "$LISTEN_FAMILY" = "dual" ]; then
+            if TCP_OUTPUT=$(ss -6 -lnt 2>/dev/null) && \
+               UDP_OUTPUT=$(ss -6 -lun 2>/dev/null) && \
+               listener_port_matches "$TCP_OUTPUT" LISTEN && \
+               listener_port_matches "$UDP_OUTPUT" UNCONN; then
+                LISTEN_OUTPUT=$(ss -6 -tulpn 2>/dev/null || true)
                 printf '\n当前 IPv6 监听状态：\n%s\n' "$LISTEN_OUTPUT"
+                break
+            fi
+        else
+            if TCP_OUTPUT=$(ss -4 -lnt 2>/dev/null) && \
+               UDP_OUTPUT=$(ss -4 -lun 2>/dev/null) && \
+               listener_port_matches "$TCP_OUTPUT" LISTEN && \
+               listener_port_matches "$UDP_OUTPUT" UNCONN; then
+                LISTEN_OUTPUT=$(ss -4 -tulpn 2>/dev/null || true)
+                printf '\n当前 IPv4 监听状态：\n%s\n' "$LISTEN_OUTPUT"
                 break
             fi
         fi
@@ -582,17 +665,32 @@ verify_listener() {
 
     if [ "$attempts" -ge 15 ]; then
         printf '\n当前监听状态：\n%s\n' "${LISTEN_OUTPUT:-ss 检查失败}"
-        die "没有检测到 ssserver 在 IPv6 [::]:$PORT 上同时监听 TCP 和 UDP。"
+        die "没有检测到 ssserver 在 $LISTEN_ADDRESS:$PORT 上同时监听 TCP 和 UDP。"
     fi
 
-    IPV4_MAPPED="未由 ss 显式显示（可能由共享 IPv6 socket 提供）"
-    if IPV4_OUTPUT=$(ss -4 -tulpn 2>/dev/null); then
-        if listener_matches "$IPV4_OUTPUT" tcp && \
-           listener_matches "$IPV4_OUTPUT" udp; then
-            IPV4_MAPPED="是（显式 IPv4 socket）"
+    if [ "$LISTEN_FAMILY" = "ipv6" ] || [ "$LISTEN_FAMILY" = "dual" ]; then
+        IPV4_MAPPED="未验证（IPv4-mapped 连接由内核双栈设置决定）"
+        if IPV4_OUTPUT=$(ss -4 -tulpn 2>/dev/null); then
+            if printf '%s\n' "$IPV4_OUTPUT" | awk -v p=":$PORT" \
+                '$1 == "tcp" && $5 ~ (p "$") { found=1 } END { exit !found }'; then
+                IPV4_MAPPED="检测到 IPv4 TCP 显式监听或映射"
+            fi
         fi
+        if [ "$LISTEN_FAMILY" = "dual" ] && has_command nc; then
+            if nc -z -w 2 127.0.0.1 "$PORT" >/dev/null 2>&1; then
+                IPV4_MAPPED="IPv4 TCP 回环连接已确认"
+            else
+                die "双栈模式下 IPv4 TCP 回环连接失败。"
+            fi
+        fi
+        if [ "$LISTEN_FAMILY" = "dual" ]; then
+            info "双栈 TCP/UDP 监听已确认，客户端地址优先使用 IPv4；$IPV4_MAPPED。"
+        else
+            info "IPv6 TCP/UDP 监听已确认；$IPV4_MAPPED。"
+        fi
+    else
+        info "IPv4 TCP/UDP 监听已确认。"
     fi
-    info "IPv6 TCP/UDP 监听已确认；IPv4-mapped 双栈状态：$IPV4_MAPPED。"
 }
 
 build_ss_uri() {
@@ -624,6 +722,10 @@ print_summary() {
     printf 'Shadowsocks 2022 部署完成\n'
     printf '========================================\n'
     printf '监听地址：%s\n' "$LISTEN_ADDRESS"
+    printf '监听协议族：%s\n' "$LISTEN_FAMILY"
+    if [ "$LISTEN_FAMILY" = "dual" ]; then
+        printf '地址优先级：IPv4\n'
+    fi
     printf '端口：    %s\n' "$PORT"
     printf '协议：    TCP + UDP\n'
     printf '加密方式：%s\n' "$METHOD"
@@ -652,6 +754,7 @@ main() {
     require_root_and_alpine
     acquire_lock
     install_dependencies
+    select_listen_address
     prompt_port
     prompt_psk
     prompt_server_address
