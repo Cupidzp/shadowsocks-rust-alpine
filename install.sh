@@ -248,12 +248,22 @@ acquire_lock() {
 
 install_dependencies() {
     info "安装 Shadowsocks、OpenRC 检查和地址检测所需的软件包。"
-    if ! apk add --no-cache \
+    if apk add --no-cache \
         shadowsocks-rust-ssserver \
         shadowsocks-rust-ssservice \
         iproute2-ss \
         curl; then
-        die "软件包安装失败。请确认 Alpine 的 community 仓库已启用。"
+        :
+    else
+        apk_status=$?
+        case "$apk_status" in
+            137|143)
+                die "apk 被系统终止（退出码 $apk_status），通常表示内存不足或容器内存限制。请先增加 RAM/Swap 后重试。"
+                ;;
+            *)
+                die "软件包安装失败（退出码 $apk_status）。请确认 Alpine 的 community 仓库已启用。"
+                ;;
+        esac
     fi
 
     SSSERVER_PATH="/usr/bin/ssserver"
